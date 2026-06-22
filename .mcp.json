@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "knowledge-base": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "./data"]
+    },
+    "ticket-store": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-memory"],
+      "env": {
+        "MEMORY_FILE_PATH": "./data/tickets/tickets.json"
+      }
+    }
+  }
+}

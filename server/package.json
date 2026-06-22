@@ -1,0 +1,11 @@
+{
+  "name": "style-chat-api",
+  "version": "1.0.0",
+  "description": "CS Style Chat Agent - CS 티켓 분류 + 말투 적응 OpenAI 호환 API 서버",
+  "type": "module",
+  "main": "index.js",
+  "dependencies": {
+    "express": "^4.21.0",
+    "cors": "^2.8.5"
+  }
+}

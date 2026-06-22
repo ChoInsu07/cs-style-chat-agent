@@ -1,0 +1,11 @@
+.env
+node_modules/
+.DS_Store
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+
+# auto-generated runtime data
+data/tone/
+data/tickets/
