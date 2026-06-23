@@ -100,30 +100,68 @@ function loadKnowledge(category) {
   return null;
 }
 
-// ── Pi CLI Agent (NVIDIA Llama for classification) ────
-async function callPiCLI_Agent(userMessage, tone, timeoutMs = 60000) {
+// ── Pre-load all knowledge ───────────────────────────
+function loadAllKnowledge() {
+  const k = {};
+  for (const cat of ["refund", "account", "technical", "billing", "general"]) {
+    const content = loadKnowledge(cat);
+    if (content) k[cat] = content;
+  }
+  return k;
+}
+
+// ── Pi CLI Agent (NVIDIA Llama orchestrates all 6 tools) ─
+async function callPiCLI_Agent(userMessage, tone, allKnowledge, history, prevResponse, userId, timeoutMs = 120000) {
+  const knowledgeCtx = Object.keys(allKnowledge).length
+    ? `Available knowledge policies:\n${Object.entries(allKnowledge).filter(([, v]) => v).map(([k, v]) => `[${k}]\n${v}`).join("\n\n")}`
+    : "지식 없음";
+
+  const historyCtx = history?.length
+    ? `Conversation history:\n${history.map(m => `[${m.role === "user" ? "User" : "Assistant"}]\n${m.content}`).join("\n\n")}`
+    : "No history";
+
   const agentPrompt =
-`You are a CS inquiry classifier for a Korean CS center.
+`You are a CS agent orchestrator for a Korean CS center. Execute the following steps IN ORDER using the available tools.
 
 Available tools:
-- classify_ticket(text): classifies CS inquiry → category, subtype, confidence, urgency, sentiment
-- extract_entities(text): extracts error codes, amounts, emails, product names from text
+- classify_ticket(text): classify CS inquiry → JSON {category, subtype, urgency, sentiment}
+- extract_entities(text): extract entities → JSON {topics, entities}
+- build_system_prompt(strategy): generate system prompt from strategy JSON
+- call_llm(messages, systemPrompt): call Qwen2.5 model → returns CS response text
+- evaluate_response(userId, agentResponse, userReply): evaluate previous response → JSON feedback
+- update_user_tone(currentTone, feedbackScore, adjustTone, dimensionFeedback): update tone → JSON {updatedTone}
 
-Instructions:
-1. Call classify_ticket with the user's original message
-2. Call extract_entities with the user's original message
-3. Then summarize in Korean
+Execution sequence:
 
-Examples:
-- "환불 받고 싶어요 ㅠㅠ" → category: refund
-- "비밀번호를 잊었어요" → category: account
-- "결제 오류 5001이 떠요" → category: technical
-- "로그인이 안 돼요" → category: account
-- "구매 취소해주세요" → category: refund
-- "에러 코드 E-404 발생" → category: technical
-- "영수증 출력 부탁드려요" → category: billing
+Step 1 — classify_ticket
+  Call: classify_ticket(text: "${userMessage}")
+  → result1 = {category, subtype, urgency, sentiment}
 
-User tone profile: ${JSON.stringify(tone)}`;
+Step 2 — extract_entities
+  Call: extract_entities(text: "${userMessage}")
+  → result2 = {topics, entities}
+
+Step 3 — build_system_prompt
+  Build strategy as a JSON string combining user tone + result1 + knowledge + history
+  Call: build_system_prompt(strategy: '{"tone":${JSON.stringify(tone)},"category":"<from result1>","urgency":"<from result1>","subtype":"<from result1>","sentiment":"<from result1>","knowledge":"<see below>","history":"<conversation history>"}')
+  → result3 = system prompt string
+
+Step 4 — call_llm
+  Call: call_llm(messages: '${JSON.stringify([...history.slice(-4), { role: "user", content: userMessage }])}', systemPrompt: "<from result3>")
+  → result4 = CS response text
+  → OUTPUT result4 as your FINAL answer (no extra commentary)
+
+Step 5 — evaluate_response (ONLY if prevResponse exists)
+  Call: evaluate_response(userId: "${userId}", agentResponse: "${prevResponse || ""}", userReply: "${userMessage}")
+  → result5 = {score, dimensionFeedback, adjust_tone}
+
+Step 6 — update_user_tone (ONLY if result5.adjust_tone is true)
+  Call: update_user_tone(currentTone: '${JSON.stringify(tone)}', feedbackScore: result5.score, adjustTone: result5.adjust_tone, dimensionFeedback: JSON.stringify(result5.dimensionFeedback))
+  → result6 = {updatedTone}
+
+${knowledgeCtx}
+${prevResponse ? `Previous assistant response: ${prevResponse}` : ""}
+User ID: ${userId}`;
 
   const args = [
     "--provider", "nvidia",
@@ -145,7 +183,6 @@ User tone profile: ${JSON.stringify(tone)}`;
       maxBuffer: 50 * 1024 * 1024,
     }).toString();
   } catch (e) {
-    // execFileSync throws on non-zero exit; stdout is in e.stdout
     if (e.stdout) raw = e.stdout.toString();
     else throw e;
   }
@@ -153,28 +190,37 @@ User tone profile: ${JSON.stringify(tone)}`;
   const lines = raw.split("\n").filter(Boolean);
   let classification = null;
   let entities = null;
+  let systemPrompt = null;
+  let response = null;
+  let feedback = null;
+  let updatedTone = null;
 
   for (const line of lines) {
     try {
       const evt = JSON.parse(line);
+      const resultText = evt.result?.content?.[0]?.text || "";
+      const toolName = evt.toolName || evt.tool?.name || "";
+
       if (evt.type === "tool_execution_end") {
-        const resultText = evt.result?.content?.[0]?.text || "";
-        const toolName = evt.toolName || evt.tool?.name || "";
         try {
           const parsed = JSON.parse(resultText);
           if (toolName === "classify_ticket") classification = parsed;
           else if (toolName === "extract_entities") entities = parsed;
-        } catch {
-          // not JSON result, skip
-        }
+          else if (toolName === "evaluate_response") feedback = parsed;
+          else if (toolName === "update_user_tone") updatedTone = parsed?.updatedTone || parsed;
+        } catch { /* non-JSON tool result */ }
+
+        if (toolName === "build_system_prompt") systemPrompt = resultText;
+        else if (toolName === "call_llm") response = resultText;
       }
-    } catch {
-      // skip non-JSON lines
-    }
+
+      if (evt.type === "response" || evt.type === "text") {
+        if (!response) response = evt.content || evt.text || "";
+      }
+    } catch { /* skip non-JSON lines */ }
   }
 
-
-  return { classification, entities };
+  return { classification, entities, systemPrompt, response, feedback, updatedTone };
 }
 
 // ── Pi CLI Subprocess (Ollama qwen-cs for generation) ──
@@ -254,7 +300,7 @@ function updateTone(current, feedback) {
   return tone;
 }
 
-// ── Main Agent (two-model: NVIDIA classify → Ollama GGUF generate) ─
+// ── Main Agent (NVIDIA 8B orchestrates 6 tools → Qwen2.5 generates) ─
 export async function runPiAgent(userId, text, history = [], prevResponse = null) {
   const tone = loadTone(userId);
   const trace = [];
@@ -263,36 +309,66 @@ export async function runPiAgent(userId, text, history = [], prevResponse = null
   console.log(`[TONE] user=${userId} warmth=${Math.round(tone.warmth * 100)}% formality=${Math.round(tone.formality * 100)}% directness=${Math.round(tone.directness * 100)}% verbosity=${Math.round(tone.verbosity * 100)}% (${isDefault ? "기본값" : "저장된 값"})`);
   trace.push(`📋 Tone: warmth=${Math.round(tone.warmth * 100)}% formality=${Math.round(tone.formality * 100)}% directness=${Math.round(tone.directness * 100)}% verbosity=${Math.round(tone.verbosity * 100)}% (${isDefault ? "기본값" : "저장된 값"})`);
 
-  console.log("[PI] Ollama qwen-cs subprocess spawn");
-  trace.push("🧩 Pi CLI → Ollama qwen-cs subprocess spawn");
+  // Pre-load all knowledge categories
+  const allKnowledge = loadAllKnowledge();
+  console.log("[MCP] knowledge-base → 5개 정책 선행 로드");
+  trace.push("📂 MCP: knowledge-base → 5개 정책 선행 로드");
 
-  // Step 1: NVIDIA Llama 3.1 8B agent loop → classification
-  let classification;
-  let entities;
-  console.log("[AGENT] calling NVIDIA agent for classification...");
+  // Step 1: NVIDIA 8B orchestrates all 6 extension tools
+  console.log("[AGENT] NVIDIA 8B → 6-tool pipeline 시작");
+  trace.push("🔧 Agent: NVIDIA 8B → tool_call 오케스트레이션 (6개 도구)");
+
   try {
-    const agentResult = await callPiCLI_Agent(text, tone);
-    if (agentResult?.classification) {
-      classification = agentResult.classification;
-      entities = agentResult.entities || extractEntities(text);
-      console.log("[AGENT] NVIDIA result:", classification.category, classification.urgency, "entities:", !!agentResult.entities);
-      trace.push(`🔧 Extension: classify_ticket → ${classification.category} (긴급도: ${classification.urgency})`);
-      trace.push(`🔧 Extension: extract_entities → 오류코드:${entities?.errorCodes?.length || 0}개, 금액:${entities?.amounts?.length || 0}개, 이메일:${entities?.emails?.length || 0}개`);
-    } else {
-      console.log("[AGENT] no classification result, falling back to regex");
-      classification = classifyTicket(text);
-      entities = extractEntities(text);
-      trace.push(`🔧 Extension: classify_ticket fallback(regex) → ${classification.category}`);
+    const agentResult = await callPiCLI_Agent(text, tone, allKnowledge, history, prevResponse, userId);
+
+    if (agentResult?.response) {
+      const cat = agentResult.classification?.category || "unknown";
+      console.log(`[AGENT] NVIDIA pipeline 완료 → ${cat}`);
+      trace.push(`🔧 Agent: 1. classify_ticket → ${cat} (긴급도: ${agentResult.classification?.urgency || "?"})`);
+      trace.push(`🔧 Agent: 2. extract_entities → 완료`);
+      trace.push(`🔧 Agent: 3. build_system_prompt → 생성 완료`);
+      trace.push(`🔧 Agent: 4. call_llm → Qwen2.5 응답 생성 완료`);
+
+      if (agentResult.feedback) {
+        saveTone(userId, agentResult.updatedTone || tone);
+        trace.push(`🔧 Agent: 5. evaluate_response → 피드백 (score: ${agentResult.feedback.score})`);
+        trace.push(`🔧 Agent: 6. update_user_tone → 말투 업데이트 완료`);
+        const changes = Object.entries(tone).map(([k, v]) =>
+          `${toneLabel(k)} ${Math.round(v * 100)}%→${Math.round((agentResult.updatedTone?.[k] ?? v) * 100)}%`
+        ).join(", ");
+        console.log(`[AGENT] 피드백 반영 → ${changes}`);
+      }
+
+      console.log(`[WEB] 응답 전송 (user=${userId})`);
+      trace.push("🖥️ Web UI → 응답 전송");
+      return {
+        response: agentResult.response,
+        trace,
+        fullLog: {
+          model: "nvidia(orchestrator)+ollama(qwen-cs)",
+          userId,
+          category: cat,
+          entities: agentResult.entities,
+          agentTools: ["classify_ticket","extract_entities","build_system_prompt","call_llm"],
+        },
+      };
     }
+    console.log("[AGENT] response 없음 → fallback");
+    trace.push("⚠️ Agent: 응답 없음 → JS fallback");
   } catch (e) {
-    console.log("[AGENT] agent call failed:", e.message, "- falling back to regex");
-    classification = classifyTicket(text);
-    entities = extractEntities(text);
-    trace.push(`🔧 Extension: classify_ticket fallback(regex after error) → ${classification.category}`);
+    console.log("[AGENT] NVIDIA pipeline 실패:", e.message, "→ JS fallback");
+    trace.push(`⚠️ Agent: NVIDIA pipeline 실패 → JS fallback`);
   }
 
-  console.log(`[MCP] knowledge-base → ${classification.category}.json 로드`);
-  trace.push(`📂 MCP: knowledge-base → ${classification.category}.json 로드`);
+  // ── Fallback: JS 함수 기반 흐름 (regex classify + Pi CLI Ollama) ─
+  console.log("[PI] Ollama qwen-cs subprocess spawn (fallback)");
+  trace.push("🧩 Pi CLI → Ollama qwen-cs subprocess spawn (fallback)");
+
+  const classification = classifyTicket(text);
+  const entities = extractEntities(text);
+  console.log("[AGENT] fallback: regex classify →", classification.category);
+  trace.push(`🔧 classify_ticket fallback → ${classification.category}`);
+
   const knowledge = loadKnowledge(classification.category);
   const systemPrompt = buildSystemPrompt(
     classification.category, classification.urgency, tone,
@@ -304,18 +380,16 @@ export async function runPiAgent(userId, text, history = [], prevResponse = null
     { role: "user", content: text },
   ];
 
-  console.log(`[SKILL] cs-style-adapter → buildSystemPrompt() (온도:${Math.round(tone.warmth * 100)}% 격식:${Math.round(tone.formality * 100)}% 직설성:${Math.round(tone.directness * 100)}% 상세도:${Math.round(tone.verbosity * 100)}%)`);
-  trace.push(`📋 Skill: cs-style-adapter → buildSystemPrompt()에 말투값 반영 (온도:${Math.round(tone.warmth * 100)}%, 격식:${Math.round(tone.formality * 100)}%, 직설성:${Math.round(tone.directness * 100)}%, 상세도:${Math.round(tone.verbosity * 100)}%)`);
+  console.log(`[SKILL] cs-style-adapter → fallback buildSystemPrompt()`);
+  trace.push(`📋 Skill: cs-style-adapter → fallback buildSystemPrompt()`);
 
-  // Step 2: Ollama qwen-cs (LoRA GGUF) for CS response generation
   try {
     const t2 = Date.now();
     const response = await callPiCLI(systemPrompt, messages);
     const elapsed = ((Date.now() - t2) / 1000).toFixed(1);
-    console.log(`[PI] Ollama qwen-cs 응답 생성 완료 (${elapsed}초)`);
-    trace.push(`🧩 Pi CLI → Ollama qwen-cs 응답 생성 완료 (${elapsed}초)`);
+    console.log(`[PI] fallback 응답 생성 완료 (${elapsed}초)`);
+    trace.push(`🧩 Pi CLI → fallback 응답 생성 완료 (${elapsed}초)`);
 
-    // Step 3: Feedback loop (evaluate → update tone)
     if (prevResponse) {
       try {
         const feedback = await evaluateResponse(prevResponse, text);
@@ -339,7 +413,7 @@ export async function runPiAgent(userId, text, history = [], prevResponse = null
     }
 
     console.log(`[WEB] 응답 전송 (user=${userId})`);
-    trace.push(`🖥️ Web UI → 응답 전송`);
+    trace.push("🖥️ Web UI → 응답 전송");
     return {
       response,
       trace,
@@ -354,10 +428,10 @@ export async function runPiAgent(userId, text, history = [], prevResponse = null
       ];
       const response = await callOllama(fallbackMsgs);
       const elapsed = ((Date.now() - t2) / 1000).toFixed(1);
-      console.log(`[PI] → 직접 Ollama 호출 (fallback, ${elapsed}초)`);
-      trace.push(`🧩 Pi CLI → 직접 Ollama 호출 (fallback, ${elapsed}초)`);
+      console.log(`[PI] → 직접 Ollama 호출 (2차 fallback, ${elapsed}초)`);
+      trace.push(`🧩 Pi CLI → 직접 Ollama 호출 (2차 fallback, ${elapsed}초)`);
       console.log(`[WEB] 응답 전송 (user=${userId})`);
-      trace.push(`🖥️ Web UI → 응답 전송`);
+      trace.push("🖥️ Web UI → 응답 전송");
       return {
         response,
         trace,
