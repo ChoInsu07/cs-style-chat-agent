@@ -42,7 +42,10 @@ async function main() {
     const result = await runPiAgent(userId, message);
     if (showLog) {
       console.log("--- Agent Log ---");
-      console.log(result.fullLog);
+      if (result.trace?.length) {
+        console.log("실행 추적:");
+        result.trace.forEach(t => console.log(`  ${t}`));
+      }
       console.log("--- end log ---\n");
     }
     console.log(`[에이전트] ${result.response}\n`);
@@ -65,7 +68,10 @@ async function main() {
 
       if (showLog) {
         console.log("\n--- Agent Log ---");
-        console.log(result.fullLog);
+        if (result.trace?.length) {
+          console.log("실행 추적:");
+          result.trace.forEach(t => console.log(`  ${t}`));
+        }
         console.log("--- end log ---\n");
       }
 

@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { execFileSync } from "node:child_process";
+import { spawn, execFileSync, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import {
   existsSync, readFileSync, writeFileSync, mkdirSync,
@@ -13,6 +13,11 @@ const TONE_DIR = resolve(ROOT, "data/tone");
 const KNOWLEDGE_DIR = resolve(ROOT, "data/knowledge");
 const TICKET_DIR = resolve(ROOT, "data/tickets");
 const OLLAMA_API = "http://localhost:11434/v1/chat/completions";
+
+function toneLabel(key) {
+  const labels = { warmth: "온도", formality: "격식", directness: "직설성", verbosity: "상세도" };
+  return labels[key] || key;
+}
 
 // ── Tone ────────────────────────────────────────────────
 function loadTone(userId) {
@@ -96,7 +101,7 @@ function loadKnowledge(category) {
 }
 
 // ── Pi CLI Agent (NVIDIA Llama for classification) ────
-async function callPiCLI_Agent(userMessage, tone, timeoutMs = 30000) {
+async function callPiCLI_Agent(userMessage, tone, timeoutMs = 60000) {
   const agentPrompt =
 `You are a CS inquiry classifier for a Korean CS center.
 
@@ -108,6 +113,15 @@ Instructions:
 1. Call classify_ticket with the user's original message
 2. Call extract_entities with the user's original message
 3. Then summarize in Korean
+
+Examples:
+- "환불 받고 싶어요 ㅠㅠ" → category: refund
+- "비밀번호를 잊었어요" → category: account
+- "결제 오류 5001이 떠요" → category: technical
+- "로그인이 안 돼요" → category: account
+- "구매 취소해주세요" → category: refund
+- "에러 코드 E-404 발생" → category: technical
+- "영수증 출력 부탁드려요" → category: billing
 
 User tone profile: ${JSON.stringify(tone)}`;
 
@@ -165,47 +179,34 @@ User tone profile: ${JSON.stringify(tone)}`;
 
 // ── Pi CLI Subprocess (Ollama qwen-cs for generation) ──
 async function callPiCLI(systemPrompt, messages, timeoutMs = 60000) {
-  const PI_BASE = [
+  const lastMsg = messages[messages.length - 1];
+  const isMultiTurn = messages.length > 1;
+
+  let finalPrompt = systemPrompt;
+  if (isMultiTurn) {
+    const historyText = messages.slice(0, -1).map(m =>
+      `[${m.role === "user" ? "사용자" : "상담사"}]\n${m.content}`
+    ).join("\n\n");
+    finalPrompt += `\n\n## 대화 기록\n\n${historyText}`;
+  }
+
+  const proc = spawnSync("pi", [
     "--provider", "ollama",
     "--model", "qwen-cs",
-    "--print",
-  ];
-
-  const proc = spawn("pi", PI_BASE, {
+    "--system-prompt", finalPrompt,
+    "--print", lastMsg.content,
+  ], {
     cwd: ROOT,
-    env: { ...process.env, PATH: process.env.PATH },
-    stdio: ["pipe", "pipe", "pipe"],
+    env: { ...process.env },
+    timeout: timeoutMs,
+    maxBuffer: 50 * 1024 * 1024,
   });
 
-  const jsonl = [
-    { role: "system", content: systemPrompt },
-    ...messages.map(m => ({ role: m.role, content: m.content })),
-  ].map(l => JSON.stringify(l)).join("\n");
-
-  let stdout = "";
-  let stderr = "";
-
-  proc.stdout.on("data", d => { stdout += d.toString(); });
-  proc.stderr.on("data", d => { stderr += d.toString(); });
-
-  const exitPromise = new Promise((resolve, reject) => {
-    proc.on("close", code => {
-      if (code === 0 && stdout.trim().length > 0) resolve(stdout.trim());
-      else reject(new Error(stderr.trim() || `exit ${code}: ${stdout.slice(0, 200)}`));
-    });
-    proc.on("error", reject);
-  });
-
-  proc.stdin.write(jsonl);
-  proc.stdin.end();
-
-  const timer = setTimeout(() => { proc.kill(); }, timeoutMs);
-
-  try {
-    return await exitPromise;
-  } finally {
-    clearTimeout(timer);
-  }
+  const stdout = (proc.stdout || "").toString().trim();
+  const stderr = (proc.stderr || "").toString().trim();
+  const outputText = stdout || stderr;
+  if (outputText.length > 0) return outputText;
+  throw new Error(stderr || `exit ${proc.status}`);
 }
 
 // ── Direct Ollama (fallback) ────────────────────────────
@@ -256,6 +257,14 @@ function updateTone(current, feedback) {
 // ── Main Agent (two-model: NVIDIA classify → Ollama GGUF generate) ─
 export async function runPiAgent(userId, text, history = [], prevResponse = null) {
   const tone = loadTone(userId);
+  const trace = [];
+  const toneFile = resolve(TONE_DIR, `${userId}.json`);
+  const isDefault = !existsSync(toneFile);
+  console.log(`[TONE] user=${userId} warmth=${Math.round(tone.warmth * 100)}% formality=${Math.round(tone.formality * 100)}% directness=${Math.round(tone.directness * 100)}% verbosity=${Math.round(tone.verbosity * 100)}% (${isDefault ? "기본값" : "저장된 값"})`);
+  trace.push(`📋 Tone: warmth=${Math.round(tone.warmth * 100)}% formality=${Math.round(tone.formality * 100)}% directness=${Math.round(tone.directness * 100)}% verbosity=${Math.round(tone.verbosity * 100)}% (${isDefault ? "기본값" : "저장된 값"})`);
+
+  console.log("[PI] Ollama qwen-cs subprocess spawn");
+  trace.push("🧩 Pi CLI → Ollama qwen-cs subprocess spawn");
 
   // Step 1: NVIDIA Llama 3.1 8B agent loop → classification
   let classification;
@@ -267,17 +276,23 @@ export async function runPiAgent(userId, text, history = [], prevResponse = null
       classification = agentResult.classification;
       entities = agentResult.entities || extractEntities(text);
       console.log("[AGENT] NVIDIA result:", classification.category, classification.urgency, "entities:", !!agentResult.entities);
+      trace.push(`🔧 Extension: classify_ticket → ${classification.category} (긴급도: ${classification.urgency})`);
+      trace.push(`🔧 Extension: extract_entities → 오류코드:${entities?.errorCodes?.length || 0}개, 금액:${entities?.amounts?.length || 0}개, 이메일:${entities?.emails?.length || 0}개`);
     } else {
       console.log("[AGENT] no classification result, falling back to regex");
       classification = classifyTicket(text);
       entities = extractEntities(text);
+      trace.push(`🔧 Extension: classify_ticket fallback(regex) → ${classification.category}`);
     }
-    } catch (e) {
+  } catch (e) {
     console.log("[AGENT] agent call failed:", e.message, "- falling back to regex");
     classification = classifyTicket(text);
     entities = extractEntities(text);
+    trace.push(`🔧 Extension: classify_ticket fallback(regex after error) → ${classification.category}`);
   }
 
+  console.log(`[MCP] knowledge-base → ${classification.category}.json 로드`);
+  trace.push(`📂 MCP: knowledge-base → ${classification.category}.json 로드`);
   const knowledge = loadKnowledge(classification.category);
   const systemPrompt = buildSystemPrompt(
     classification.category, classification.urgency, tone,
@@ -289,38 +304,67 @@ export async function runPiAgent(userId, text, history = [], prevResponse = null
     { role: "user", content: text },
   ];
 
+  console.log(`[SKILL] cs-style-adapter → buildSystemPrompt() (온도:${Math.round(tone.warmth * 100)}% 격식:${Math.round(tone.formality * 100)}% 직설성:${Math.round(tone.directness * 100)}% 상세도:${Math.round(tone.verbosity * 100)}%)`);
+  trace.push(`📋 Skill: cs-style-adapter → buildSystemPrompt()에 말투값 반영 (온도:${Math.round(tone.warmth * 100)}%, 격식:${Math.round(tone.formality * 100)}%, 직설성:${Math.round(tone.directness * 100)}%, 상세도:${Math.round(tone.verbosity * 100)}%)`);
+
   // Step 2: Ollama qwen-cs (LoRA GGUF) for CS response generation
   try {
+    const t2 = Date.now();
     const response = await callPiCLI(systemPrompt, messages);
+    const elapsed = ((Date.now() - t2) / 1000).toFixed(1);
+    console.log(`[PI] Ollama qwen-cs 응답 생성 완료 (${elapsed}초)`);
+    trace.push(`🧩 Pi CLI → Ollama qwen-cs 응답 생성 완료 (${elapsed}초)`);
 
     // Step 3: Feedback loop (evaluate → update tone)
     if (prevResponse) {
       try {
         const feedback = await evaluateResponse(prevResponse, text);
         if (feedback) {
+          const before = { ...tone };
           const newTone = updateTone(tone, feedback);
           saveTone(userId, newTone);
+          const changes = Object.keys(before).map(k =>
+            `${toneLabel(k)} ${Math.round(before[k] * 100)}%→${Math.round((newTone[k] ?? before[k]) * 100)}%`
+          ).join(", ");
+          console.log(`[SKILL] evaluate_response → 피드백 반영 (score: ${feedback.score}) → ${changes}`);
+          trace.push(`📋 Skill: evaluate_response → 피드백 반영 (score: ${feedback.score}) → ${changes}`);
+        } else {
+          console.log("[SKILL] evaluate_response → 피드백 없음");
+          trace.push(`📋 Skill: evaluate_response → 피드백 없음`);
         }
-      } catch {}
+      } catch {
+        console.log("[SKILL] evaluate_response → 평가 실패");
+        trace.push(`📋 Skill: evaluate_response → 평가 실패`);
+      }
     }
 
+    console.log(`[WEB] 응답 전송 (user=${userId})`);
+    trace.push(`🖥️ Web UI → 응답 전송`);
     return {
       response,
+      trace,
       fullLog: { model: "nvidia+ollama(qwen-cs)", userId, category: classification.category, entities },
     };
   } catch (err) {
     try {
+      const t2 = Date.now();
       const fallbackMsgs = [
         { role: "system", content: systemPrompt },
         ...messages,
       ];
       const response = await callOllama(fallbackMsgs);
+      const elapsed = ((Date.now() - t2) / 1000).toFixed(1);
+      console.log(`[PI] → 직접 Ollama 호출 (fallback, ${elapsed}초)`);
+      trace.push(`🧩 Pi CLI → 직접 Ollama 호출 (fallback, ${elapsed}초)`);
+      console.log(`[WEB] 응답 전송 (user=${userId})`);
+      trace.push(`🖥️ Web UI → 응답 전송`);
       return {
         response,
+        trace,
         fullLog: { model: "direct-ollama(qwen-cs)", userId, category: classification.category, entities, fallback: true },
       };
     } catch (fallbackErr) {
-      return { response: `[오류] ${err.message}`, fullLog: err.message };
+      return { response: `[오류] ${err.message}`, fullLog: err.message, trace: [] };
     }
   }
 }
@@ -428,22 +472,16 @@ export async function mcpDemonstration() {
 // ── Startup Validation ─────────────────────────────────
 export async function validatePiSetup() {
   try {
-    const proc = spawn("pi", ["--list-models"], {
+    const proc = spawnSync("pi", ["--list-models"], {
       cwd: ROOT,
       env: { ...process.env, PATH: process.env.PATH },
-      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 10000,
     });
-    let stdout = "";
-    let stderr = "";
-    proc.stdout.on("data", d => { stdout += d.toString(); });
-    proc.stderr.on("data", d => { stderr += d.toString(); });
-    const code = await new Promise(rs => {
-      proc.on("close", rs);
-      setTimeout(() => { proc.kill(); rs(1); }, 10000);
-    });
+    const stderr = (proc.stderr || "").toString();
+    const output = stderr.trim();
     return {
-      ok: code === 0 && stderr.includes("ollama") && stderr.includes("qwen-cs"),
-      output: stderr.trim(),
+      ok: output.includes("ollama") && output.includes("qwen-cs"),
+      output,
     };
   } catch {
     return { ok: false, output: "error" };
