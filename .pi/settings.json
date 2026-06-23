@@ -1,0 +1,4 @@
+{
+  "extensions": ["../extensions/chat-tools.ts"],
+  "skills": ["../skills/cs-style-adapter"]
+}

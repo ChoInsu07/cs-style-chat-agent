@@ -9,3 +9,6 @@ __pycache__/
 # auto-generated runtime data
 data/tone/
 data/tickets/
+
+# model files (GGUF, too large for git)
+model/

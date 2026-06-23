@@ -1,10 +1,19 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-const LLM_API = "http://localhost:8000/v1/chat/completions";
+const LLM_API = "http://localhost:11434/v1/chat/completions";
 
 function textResult(text: string, isError = false) {
   return { content: [{ type: "text" as const, text }], details: {}, isError };
+}
+
+function fixJSON(raw: string): string {
+  try { JSON.parse(raw); return raw; } catch {}
+  return raw
+    .replace(/'/g, '"')
+    .replace(/True/g, "true")
+    .replace(/False/g, "false")
+    .replace(/None/g, "null");
 }
 
 async function callLLM(system: string, user: string): Promise<string> {
@@ -12,7 +21,7 @@ async function callLLM(system: string, user: string): Promise<string> {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: "qwen",
+      model: "qwen-cs",
       messages: [
         { role: "system", content: system },
         { role: "user", content: user },
@@ -29,6 +38,25 @@ async function callLLM(system: string, user: string): Promise<string> {
 
 export default function (pi: ExtensionAPI) {
 
+  // ── Provider: NVIDIA 등록 (Pi CLI 오케스트레이션용) ──────────
+  pi.registerProvider("nvidia", {
+    name: "NVIDIA",
+    baseUrl: "https://integrate.api.nvidia.com/v1",
+    apiKey: "NVIDIA_API_KEY",
+    api: "openai-completions",
+    models: [
+      {
+        id: "meta/llama-3.1-8b-instruct",
+        name: "Llama 3.1 8B",
+        reasoning: false,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 128000,
+        maxTokens: 4096,
+      },
+    ],
+  });
+
   // ── 도구 1: CS 문의 분류 ──────────────────────────────────────
   pi.registerTool({
     name: "classify_ticket",
@@ -42,28 +70,18 @@ export default function (pi: ExtensionAPI) {
         const text = params.text.trim();
         if (!text) return textResult(JSON.stringify({ category: "general", confidence: 0 }));
 
-        const system = "너는 CS 문의를 분류하는 전문가다. 다음 JSON만 출력해.\n{\"category\": \"refund\"|\"account\"|\"technical\"|\"billing\"|\"general\", \"subtype\": \"...\", \"confidence\": 0.0~1.0, \"urgency\": \"high\"|\"medium\"|\"low\", \"sentiment\": \"화남\"|\"불안\"|\"실망\"|\"중립\"|\"긍정\"}\n- 환불/취소/지연 → refund\n- 로그인/비밀번호/계정 → account\n- 에러/버그/오류/설치 → technical\n- 결제/요금/영수증 → billing\n- 그 외 → general";
-        const llmRaw = await callLLM(system, text);
-        let result: any;
-        try {
-          result = JSON.parse(llmRaw);
-        } catch {
-          const cats: Record<string, RegExp> = {
-            refund: /환불|취소|돌려|refund|cancel/i,
-            account: /로그인|비밀번호|계정|login|password/i,
-            technical: /에러|오류|버그|설치|error|bug|crash/i,
-            billing: /결제|요금|청구|영수증|billing|payment/i,
-          };
-          const matched = Object.entries(cats).find(([, re]) => re.test(text));
-          result = { category: matched?.[0] || "general", subtype: "inquiry", confidence: 0.6, urgency: "medium", sentiment: "중립" };
-        }
-        return textResult(JSON.stringify({
-          category: result.category || "general",
-          subtype: result.subtype || "inquiry",
-          confidence: result.confidence || 0.5,
-          urgency: result.urgency || "medium",
-          sentiment: result.sentiment || "중립",
-        }));
+        // regex-only: LLM 호출 없음 (속도 최적화)
+        const cats: Record<string, RegExp> = {
+          refund: /환불|취소|돌려|refund|cancel/i,
+          account: /로그인|비밀번호|계정|login|password/i,
+          technical: /에러|오류|버그|설치|error|bug|crash/i,
+          billing: /결제|요금|청구|영수증|billing|payment/i,
+        };
+        const matched = Object.entries(cats).find(([, re]) => re.test(text));
+        const category = matched?.[0] || "general";
+        const urgency = /급해|빨리|긴급|중요|빠른|오류|안됨$|고장/i.test(text) ? "high" : "medium";
+        const sentiment = /ㅠㅠ|짜증|화나|불편|속상/i.test(text) ? "화남" : /ㅠ|죄송|걱정|어떡/i.test(text) ? "불안" : /감사|부탁|친절|고맙/i.test(text) ? "긍정" : "중립";
+        return textResult(JSON.stringify({ category, subtype: "inquiry", confidence: 0.8, urgency, sentiment }));
       } catch (e: any) {
         return textResult(JSON.stringify({ category: "general", subtype: "inquiry", confidence: 0 }), true);
       }
@@ -107,7 +125,7 @@ export default function (pi: ExtensionAPI) {
     }),
     execute: async (_id, params) => {
       try {
-        const s = JSON.parse(params.strategy);
+        const s = JSON.parse(fixJSON(params.strategy));
         const t = s.tone || {};
 
         const formality = typeof t.formality === "number" ? t.formality : 0.5;
@@ -174,24 +192,28 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "call_llm",
     label: "Call Local LLM",
-    description: "llama.cpp 서버(localhost:8000)를 호출해 Qwen LoRA 모델의 응답을 받아온다.",
+    description: "Ollama 서버(localhost:11434)를 호출해 qwen-cs 모델의 응답을 받아온다.",
     parameters: Type.Object({
       messages: Type.String({ description: "대화 메시지 배열 (JSON 문자열)" }),
       systemPrompt: Type.String({ description: "적용할 system prompt" }),
     }),
     execute: async (_id, params) => {
       try {
-        const messages = JSON.parse(params.messages);
+        const messages = JSON.parse(fixJSON(params.messages));
+        const systemContent = (params.systemPrompt || "").trim() || "당신은 CS 상담사 AI입니다. 사용자의 문의에 친절하게 답변하세요.";
+        const validMessages = messages.filter(
+          (m: any) => m && typeof m.content === "string" && m.content.trim().length > 0
+        );
         const fullMessages = [
-          { role: "system", content: params.systemPrompt },
-          ...messages,
+          { role: "system", content: systemContent },
+          ...validMessages,
         ];
 
         const res = await fetch(LLM_API, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            model: "qwen",
+            model: "qwen-cs",
             messages: fullMessages,
             temperature: 0.7,
             max_tokens: 2048,

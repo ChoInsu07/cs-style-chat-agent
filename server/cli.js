@@ -54,7 +54,7 @@ async function main() {
     let prevResponse = null;
 
     while (true) {
-      const input = prompt("> ");
+      const input = await prompt("> ");
       if (input === null || input.trim() === "/quit") break;
 
       const text = input.trim();

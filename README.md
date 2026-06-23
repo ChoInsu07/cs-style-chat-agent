@@ -7,75 +7,69 @@ Pi Agent가 CS 문의를 분석·분류하고, 사용자의 언어 패턴에서 
 ## 주요 기능
 
 - **CS 문의 자동 분류** — 환불/계정/기술/결제/일반 5개 카테고리 + 하위 유형
-- **사용자 말투 분석** — tone-profiler가 첫 메시지부터 formality/warmth/directness/verbosity 실시간 추정
+- **사용자 말투 분석** — formality/warmth/directness/verbosity 파라미터 관리
 - **지식베이스 검색** — 분류된 카테고리의 FAQ/정책을 자동 조회해 답변에 포함
 - **긴급도·감정 분석** — 긴급도(상/중/하) + 감정(화남/불안/중립/긍정) 판단
 - **피드백 학습** — 사용자의 반응을 평가해 tone 파라미터를 차원별로 진화
-- **Lobe Chat CoT 시각화** — 에이전트의 7단계 추론 과정을 실시간 표시
+- **Lobe Chat Web UI** — OpenAI 호환 API로 간단히 연동
 
 ## 기술 스택
 
 | 기술 | 용도 |
 |---|---|
-| **Pi** | 에이전트 오케스트레이션 |
-| **llama.cpp** | Qwen LoRA 모델 서빙 |
-| **Lobe Chat** | Web UI (채팅 인터페이스 + CoT 시각화) |
+| **Pi CLI** | 에이전트 오케스트레이션 (subprocess spawn) |
+| **Ollama** | Qwen LoRA 모델 서빙 (qwen-cs, 1.5B GGUF) |
+| **Lobe Chat** | Web UI (채팅 인터페이스) |
 | **Express** | OpenAI 호환 API 서버 |
-| **MCP** | knowledge-base (filesystem) + ticket-store (memory) |
+| **MCP** | knowledge-base (filesystem) + ticket-store (memory) — 시동 demo |
 | **Node.js** | 서버 런타임 |
 
-## 설치 방법
+## 사전 준비
 
-### 1. 사전 준비
-
-- Node.js 18+
-- Pi CLI 설치
-- Docker (Lobe Chat)
-- Qwen GGUF LoRA 모델
+| 항목 | 설치 방법 | 필수 |
+|------|----------|------|
+| **Node.js 18+** | `node -v`로 확인 | 필수 |
+| **Ollama** | `brew install ollama` | 필수 |
+| **Pi CLI** | `npm install -g @earendil-works/pi-coding-agent` | 필수 |
+| **Qwen GGUF 모델** | LoRA 병합 GGUF를 Ollama에 import | 필수 |
+| **서버 의존성** | `cd server && npm install` | 필수 |
+| **Docker** | Lobe Chat UI 사용 시에만 | 선택 |
 
 ```bash
-# Pi CLI 설치
+# 1. Ollama 설치
+brew install ollama
+
+# 2. GGUF 모델 import (예시)
+ollama create qwen-cs -f Modelfile
+
+# 3. Pi CLI 설치
 npm install -g @earendil-works/pi-coding-agent
-```
 
-### 2. 저장소 클론
-
-```bash
-git clone https://github.com/YOUR_USERNAME/cs-style-chat-agent.git
-cd cs-style-chat-agent
-```
-
-### 3. 서버 의존성 설치
-
-```bash
+# 4. 서버 의존성 설치
 cd server && npm install
 ```
 
-### 4. GGUF 모델 준비
-
-`model/` 디렉토리에 Qwen GGUF 파일 (LoRA 병합)을 배치합니다.
-
 ## 실행 방법
 
----
+> 사전 준비의 모든 항목이 완료된 상태여야 합니다.
 
-### CLI 실행 (Lobe Chat 불필요)
-
-전제 조건: llama.cpp 서버(port 8000) + API 서버(port 9090)만 실행
+### 1. 서버 실행 (CLI / UI 공통)
 
 ```bash
-# llama.cpp 서버
-llama-server -m model/model.gguf --port 8000
+# 터미널 1: Ollama 서버
+ollama serve
 
-# API 서버
-cd server && node index.js
+# 터미널 2: Express API 서버 (포트 9090)
+node server/index.js
 ```
+
+### 2. CLI 실행 (Lobe Chat 불필요)
 
 ```bash
 # 단일 문의
 node server/cli.js -u user1 -m "환불 받고 싶어요"
 
-# 대화형 모드 (입력란에서 주고받기)
+# 대화형 모드
 node server/cli.js -u user1
 
 # 전체 Agent 로그 출력
@@ -95,11 +89,7 @@ CS Style Chat Agent — 대화형 모드 (userId: user1)
 🤖 안녕하세요~ 환불 도와드릴게요! ...
 ```
 
----
-
-### UI 실행 (Lobe Chat)
-
-전제 조건: llama.cpp 서버(port 8000) + API 서버(port 9090) + Docker
+### 3. UI 실행 (Lobe Chat)
 
 ```bash
 # Lobe Chat 실행
@@ -119,14 +109,14 @@ Lobe Chat 설정:
 
 ```
 사용자1 (?userId=user1): "환불 받고 싶어요 ㅠㅠ 친절하게 알려주세요"
-  → tone-profiler: formality 0.3, warmth 0.8
-  → classify_ticket: refund
-  → MCP knowledge-base: 환불 정책 검색
+  → classifyTicket: refund
+  → loadTone: formality 0.5, warmth 0.5 (신규, 기본값)
+  → loadKnowledge: 환불 정책 검색
   → "안녕하세요~ 환불 도와드릴게요! ..."
 
 사용자2 (?userId=user2): "결제 오류. 로그ID ERR-942. 조치 바람."
-  → tone-profiler: formality 0.8, directness 0.9
-  → classify_ticket: technical
+  → classifyTicket: technical
+  → loadTone: formality 0.8, directness 0.9 (기존)
   → "ERR-942 관련 조치사항입니다. ..."
 ```
 
@@ -134,8 +124,9 @@ Lobe Chat 설정:
 
 ```
 사용자1: "너무 딱딱해요"
-  → evaluate_response: dimensionFeedback { formality: -0.8 }
-  → update_user_tone: formality -0.08 (formality 차원만 정확히 조정)
+  → evaluateResponse: dimensionFeedback { formality: -0.8 }
+  → updateTone: formality -0.08
+  → saveTone: data/tone/user1.json 갱신
   → 다음 응답부터 덜 격식 있는 부드러운 톤으로 변경
 ```
 
@@ -144,22 +135,17 @@ Lobe Chat 설정:
 ```
 cs-style-chat-agent/
 ├── .mcp.json                # MCP 설정 (knowledge-base + ticket-store)
-├── .pi/agents/              # 서브에이전트 (3개)
-│   ├── tone-profiler.md
-│   ├── ticket-analyzer.md
-│   └── response-composer.md
 ├── data/
 │   ├── knowledge/           # FAQ/정책 데이터 (5개 카테고리)
 │   ├── tickets/             # 티켓 이력 (자동 생성)
 │   └── tone/                # tone 파라미터 (자동 생성)
 ├── extensions/
-│   └── chat-tools.ts        # Pi Extension (6개 도구)
-├── model/                   # GGUF 모델 (직접 배치)
+│   └── chat-tools.ts        # Pi Extension (6개 도구, Pi CLI 로드용)
 ├── server/
 │   ├── cli.js               # CLI 실행기 (Lobe Chat 불필요)
 │   ├── index.js             # Express API (OpenAI 호환)
 │   ├── package.json
-│   └── pi-agent.js          # Pi Agent MCP-first 7단계 루프
+│   └── pi-agent.js          # Pi Agent 4단계 루프 (실제 실행 코드)
 ├── skills/
 │   └── cs-style-adapter/
 │       └── SKILL.md         # CS+tone 오케스트레이터
@@ -172,10 +158,12 @@ cs-style-chat-agent/
 
 | 구성 요소 | 활용 내용 |
 |---|---|
-| **Pi** | MCP-first 7단계 에이전트 루프, 서브에이전트 병렬 실행(3개), 도구 호출 |
-| **Skill (1개)** | `cs-style-adapter` — MCP-first → Extension → subagent parallel → MCP-write 오케스트레이션 |
-| **MCP (2개)** | `knowledge-base` (filesystem, data/ 전체) + `ticket-store` (memory) — 읽기/쓰기 모두 수행, Extension은 순수 계산만 |
+| **Pi CLI** | `spawn("pi", ...)` subprocess로 Ollama Qwen 호출, Extension 도구 로드 |
+| **Skill (1개)** | `cs-style-adapter` — 분류→프롬프트→LLM→피드백 4단계 오케스트레이션 규칙 정의 |
+| **MCP (2개)** | `knowledge-base` (filesystem) + `ticket-store` (memory) — 시동 시 JSON-RPC demo에 사용 |
 | **Extension (6개 도구)** | classify_ticket, extract_entities, build_system_prompt, call_llm, evaluate_response, update_user_tone |
+
+> Extension 도구는 Pi CLI가 로드하지만, 1.5B 모델이 tool_call을 생성하지 못하므로 실제 실행은 pi-agent.js의 JS 함수가 직접 담당합니다.
 
 ## 라이선스
 
