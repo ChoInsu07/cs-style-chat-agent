@@ -34,6 +34,15 @@ function saveTone(userId, tone) {
   } catch {}
 }
 
+// ── SKILL.md 로드 ──────────────────────────────────────
+function loadSkillMd() {
+  const p = resolve(ROOT, "skills/cs-style-adapter/SKILL.md");
+  if (existsSync(p)) {
+    try { return readFileSync(p, "utf-8"); } catch {}
+  }
+  return "";
+}
+
 // ── classify_ticket (확장 도구 #1) ──────────────────────
 function classifyTicket(text) {
   const cats = {
@@ -100,85 +109,66 @@ function loadKnowledge(category) {
   return null;
 }
 
-// ── Pre-load all knowledge ───────────────────────────
-function loadAllKnowledge() {
-  const k = {};
-  for (const cat of ["refund", "account", "technical", "billing", "general"]) {
-    const content = loadKnowledge(cat);
-    if (content) k[cat] = content;
-  }
-  return k;
-}
-
-// ── Pi CLI Agent (NVIDIA Llama orchestrates all 6 tools) ─
-async function callPiCLI_Agent(userMessage, tone, allKnowledge, history, prevResponse, userId, timeoutMs = 120000) {
-  const knowledgeCtx = Object.keys(allKnowledge).length
-    ? `Available knowledge policies:\n${Object.entries(allKnowledge).filter(([, v]) => v).map(([k, v]) => `[${k}]\n${v}`).join("\n\n")}`
-    : "지식 없음";
-
+// ── Pi CLI Agent (NVIDIA Llama orchestrates all 8 tools) ─
+async function callPiCLI_Agent(userMessage, tone, history, prevResponse, userId, timeoutMs = 180000) {
   const historyCtx = history?.length
     ? `Conversation history:\n${history.map(m => `[${m.role === "user" ? "User" : "Assistant"}]\n${m.content}`).join("\n\n")}`
     : "No history";
 
-  const agentPrompt =
-`You are a CS agent orchestrator for a Korean CS center. Execute the following steps IN ORDER using the available tools.
+  const skillMd = loadSkillMd();
+  const orchestrationMessage =
+`## Orchestration Task
 
-Available tools:
-- classify_ticket(text): classify CS inquiry → JSON {category, subtype, urgency, sentiment}
-- extract_entities(text): extract entities → JSON {topics, entities}
-- build_system_prompt(strategy): generate system prompt from strategy JSON
-- call_llm(messages, systemPrompt): call Qwen2.5 model → returns CS response text
-- evaluate_response(userId, agentResponse, userReply): evaluate previous response → JSON feedback
-- update_user_tone(currentTone, feedbackScore, adjustTone, dimensionFeedback): update tone → JSON {updatedTone}
+${skillMd ? `### SKILL.md\n\n${skillMd}\n\n---\n\n` : ""}### Available Tools
 
-Execution sequence:
+- classify_ticket(text)
+- extract_entities(text)
+- read_knowledge_policy(category): MCP knowledge-base (reads policy files)
+- build_system_prompt(strategy: JSON string)
+- call_llm(messages: JSON array, systemPrompt: string)
+- evaluate_response(userId, agentResponse, userReply)
+- update_user_tone(currentTone, feedbackScore, adjustTone, dimensionFeedback)
+- save_ticket(data: JSON string): MCP ticket-store
 
-Step 1 — classify_ticket
-  Call: classify_ticket(text: "${userMessage}")
-  → result1 = {category, subtype, urgency, sentiment}
+### Context
 
-Step 2 — extract_entities
-  Call: extract_entities(text: "${userMessage}")
-  → result2 = {topics, entities}
+- User ID: ${userId}
+- Current tone: ${JSON.stringify(tone)}
+- Previous response: ${prevResponse ? `"${prevResponse}"` : "none (first turn)"}
+- Conversation history: ${historyCtx}
 
-Step 3 — build_system_prompt
-  Build strategy as a JSON string combining user tone + result1 + knowledge + history
-  Call: build_system_prompt(strategy: '{"tone":${JSON.stringify(tone)},"category":"<from result1>","urgency":"<from result1>","subtype":"<from result1>","sentiment":"<from result1>","knowledge":"<see below>","history":"<conversation history>"}')
-  → result3 = system prompt string
+### Instructions
 
-Step 4 — call_llm
-  Call: call_llm(messages: '${JSON.stringify([...history.slice(-4), { role: "user", content: userMessage }])}', systemPrompt: "<from result3>")
-  → result4 = CS response text
-  → OUTPUT result4 as your FINAL answer (no extra commentary)
+Execute EXACTLY in this order. Output ONLY final CS response from Step 5 — no extra commentary.
 
-Step 5 — evaluate_response (ONLY if prevResponse exists)
-  Call: evaluate_response(userId: "${userId}", agentResponse: "${prevResponse || ""}", userReply: "${userMessage}")
-  → result5 = {score, dimensionFeedback, adjust_tone}
+Step 1 — classify_ticket(text: "${userMessage}")
+Step 2 — extract_entities(text: "${userMessage}")
+Step 3 — read_knowledge_policy(category: result1.category)
+Step 4 — build_system_prompt(strategy: '{"tone":...,"category":"result1.category","knowledge":"result3","history":"..."}') — strategy MUST be valid JSON
+Step 5 — call_llm(messages: '[{"role":"user","content":"${userMessage}"}]', systemPrompt: result4) — output result5 as final answer
+Step 6 — evaluate_response(userId: "${userId}", agentResponse: "${prevResponse || ""}", userReply: "${userMessage}")
+Step 7 — update_user_tone(currentTone: '${JSON.stringify(tone)}', feedbackScore: result6.score, adjustTone: result6.adjust_tone, dimensionFeedback: 'JSON of result6.dimensionFeedback')
+Step 8 — save_ticket(data: JSON.stringify({userId: "${userId}", category: result1.category, response: result5}))
 
-Step 6 — update_user_tone (ONLY if result5.adjust_tone is true)
-  Call: update_user_tone(currentTone: '${JSON.stringify(tone)}', feedbackScore: result5.score, adjustTone: result5.adjust_tone, dimensionFeedback: JSON.stringify(result5.dimensionFeedback))
-  → result6 = {updatedTone}
+### User Message
 
-${knowledgeCtx}
-${prevResponse ? `Previous assistant response: ${prevResponse}` : ""}
-User ID: ${userId}`;
+${userMessage}`;
 
   const args = [
     "--provider", "nvidia",
     "--model", "meta/llama-3.1-8b-instruct",
     "--no-builtin-tools",
-    "--no-skills",
-    "--system-prompt", agentPrompt,
+    "--system-prompt", "You are a CS orchestrator with access to Extension and MCP tools. Follow the user's orchestration instructions step by step. Use tools exactly as directed.",
     "--mode", "json",
     "--print",
-    userMessage,
+    orchestrationMessage,
   ];
 
   let raw = "";
   try {
     raw = execFileSync("pi", args, {
       cwd: ROOT,
-      env: { ...process.env },
+      env: { NVIDIA_API_KEY: process.env.NVIDIA_API_KEY, ...process.env },
       timeout: timeoutMs,
       maxBuffer: 50 * 1024 * 1024,
     }).toString();
@@ -216,6 +206,16 @@ User ID: ${userId}`;
 
       if (evt.type === "response" || evt.type === "text") {
         if (!response) response = evt.content || evt.text || "";
+      }
+
+      if (evt.type === "agent_end") {
+        const msgs = evt.messages || [];
+        const lastAssistant = [...msgs].reverse().find(m =>
+          m.role === "assistant" && m.content?.[0]?.type === "text" && m.content?.[0]?.text
+        );
+        if (lastAssistant && !response) {
+          response = lastAssistant.content[0].text;
+        }
       }
     } catch { /* skip non-JSON lines */ }
   }
@@ -309,30 +309,28 @@ export async function runPiAgent(userId, text, history = [], prevResponse = null
   console.log(`[TONE] user=${userId} warmth=${Math.round(tone.warmth * 100)}% formality=${Math.round(tone.formality * 100)}% directness=${Math.round(tone.directness * 100)}% verbosity=${Math.round(tone.verbosity * 100)}% (${isDefault ? "기본값" : "저장된 값"})`);
   trace.push(`📋 Tone: warmth=${Math.round(tone.warmth * 100)}% formality=${Math.round(tone.formality * 100)}% directness=${Math.round(tone.directness * 100)}% verbosity=${Math.round(tone.verbosity * 100)}% (${isDefault ? "기본값" : "저장된 값"})`);
 
-  // Pre-load all knowledge categories
-  const allKnowledge = loadAllKnowledge();
-  console.log("[MCP] knowledge-base → 5개 정책 선행 로드");
-  trace.push("📂 MCP: knowledge-base → 5개 정책 선행 로드");
-
-  // Step 1: NVIDIA 8B orchestrates all 6 extension tools
-  console.log("[AGENT] NVIDIA 8B → 6-tool pipeline 시작");
-  trace.push("🔧 Agent: NVIDIA 8B → tool_call 오케스트레이션 (6개 도구)");
+  // Step 1: NVIDIA 8B orchestrates all 8 extension+MCP tools
+  const _skillMd = loadSkillMd();
+  console.log(`[AGENT] NVIDIA 8B → 8-tool pipeline 시작 (SKILL.md=${_skillMd.length > 0 ? `${_skillMd.length}B loaded` : "not found"})`);
+  trace.push(`🔧 Agent: NVIDIA 8B → SKILL.md(${_skillMd.length}B) + MCP(knowledge-base/ticket-store) + Extension(8 tools)`);
 
   try {
-    const agentResult = await callPiCLI_Agent(text, tone, allKnowledge, history, prevResponse, userId);
+    const agentResult = await callPiCLI_Agent(text, tone, history, prevResponse, userId);
 
     if (agentResult?.response) {
       const cat = agentResult.classification?.category || "unknown";
       console.log(`[AGENT] NVIDIA pipeline 완료 → ${cat}`);
-      trace.push(`🔧 Agent: 1. classify_ticket → ${cat} (긴급도: ${agentResult.classification?.urgency || "?"})`);
-      trace.push(`🔧 Agent: 2. extract_entities → 완료`);
-      trace.push(`🔧 Agent: 3. build_system_prompt → 생성 완료`);
-      trace.push(`🔧 Agent: 4. call_llm → Qwen2.5 응답 생성 완료`);
+      trace.push(`🔧 1. classify_ticket → ${cat} (${agentResult.classification?.urgency || "?"})`);
+      trace.push(`🔧 2. extract_entities → 완료`);
+      trace.push(`🔧 3. read_knowledge_policy → MCP knowledge-base 조회`);
+      trace.push(`🔧 4. build_system_prompt → 생성 완료`);
+      trace.push(`🔧 5. call_llm → Qwen2.5 응답 생성 완료`);
 
       if (agentResult.feedback) {
         saveTone(userId, agentResult.updatedTone || tone);
-        trace.push(`🔧 Agent: 5. evaluate_response → 피드백 (score: ${agentResult.feedback.score})`);
-        trace.push(`🔧 Agent: 6. update_user_tone → 말투 업데이트 완료`);
+        trace.push(`🔧 6. evaluate_response → 피드백 (score: ${agentResult.feedback.score})`);
+        trace.push(`🔧 7. update_user_tone → 말투 업데이트 완료`);
+        trace.push(`🔧 8. save_ticket → MCP ticket-store 저장`);
         const changes = Object.entries(tone).map(([k, v]) =>
           `${toneLabel(k)} ${Math.round(v * 100)}%→${Math.round((agentResult.updatedTone?.[k] ?? v) * 100)}%`
         ).join(", ");
@@ -345,101 +343,52 @@ export async function runPiAgent(userId, text, history = [], prevResponse = null
         response: agentResult.response,
         trace,
         fullLog: {
-          model: "nvidia(orchestrator)+ollama(qwen-cs)",
+          model: "nvidia(orchestrator)+qwen-cs(generator)",
+          skill: "cs-style-adapter",
+          mcp: ["knowledge-base", "ticket-store"],
           userId,
           category: cat,
           entities: agentResult.entities,
-          agentTools: ["classify_ticket","extract_entities","build_system_prompt","call_llm"],
+          agentTools: ["classify_ticket","extract_entities","read_knowledge_policy","build_system_prompt","call_llm","evaluate_response","update_user_tone","save_ticket"],
         },
       };
     }
     console.log("[AGENT] response 없음 → fallback");
-    trace.push("⚠️ Agent: 응답 없음 → JS fallback");
+    trace.push("⚠️ Agent: 응답 없음 → direct Ollama fallback");
   } catch (e) {
-    console.log("[AGENT] NVIDIA pipeline 실패:", e.message, "→ JS fallback");
-    trace.push(`⚠️ Agent: NVIDIA pipeline 실패 → JS fallback`);
+    console.log("[AGENT] NVIDIA pipeline 실패:", e.message, "→ direct Ollama fallback");
+    trace.push(`⚠️ Agent: NVIDIA pipeline 실패 → direct Ollama fallback`);
   }
 
-  // ── Fallback: JS 함수 기반 흐름 (regex classify + Pi CLI Ollama) ─
-  console.log("[PI] Ollama qwen-cs subprocess spawn (fallback)");
-  trace.push("🧩 Pi CLI → Ollama qwen-cs subprocess spawn (fallback)");
+  // ── Fallback: regex classify + direct Ollama (no Pi CLI) ─
+  console.log("[FALLBACK] regex classify + direct Ollama");
+  trace.push("🔄 Fallback: regex classify + direct Ollama HTTP");
 
   const classification = classifyTicket(text);
-  const entities = extractEntities(text);
-  console.log("[AGENT] fallback: regex classify →", classification.category);
-  trace.push(`🔧 classify_ticket fallback → ${classification.category}`);
-
-  const knowledge = loadKnowledge(classification.category);
-  const systemPrompt = buildSystemPrompt(
-    classification.category, classification.urgency, tone,
-    classification.sentiment, knowledge
-  );
-
   const messages = [
     ...history.slice(-4).map(m => ({ role: m.role, content: m.content })),
     { role: "user", content: text },
   ];
-
-  console.log(`[SKILL] cs-style-adapter → fallback buildSystemPrompt()`);
-  trace.push(`📋 Skill: cs-style-adapter → fallback buildSystemPrompt()`);
+  const fallbackSys = buildSystemPrompt(classification.category, classification.urgency, tone, classification.sentiment, null);
 
   try {
     const t2 = Date.now();
-    const response = await callPiCLI(systemPrompt, messages);
+    const response = await callOllama([
+      { role: "system", content: fallbackSys },
+      ...messages,
+    ]);
     const elapsed = ((Date.now() - t2) / 1000).toFixed(1);
-    console.log(`[PI] fallback 응답 생성 완료 (${elapsed}초)`);
-    trace.push(`🧩 Pi CLI → fallback 응답 생성 완료 (${elapsed}초)`);
-
-    if (prevResponse) {
-      try {
-        const feedback = await evaluateResponse(prevResponse, text);
-        if (feedback) {
-          const before = { ...tone };
-          const newTone = updateTone(tone, feedback);
-          saveTone(userId, newTone);
-          const changes = Object.keys(before).map(k =>
-            `${toneLabel(k)} ${Math.round(before[k] * 100)}%→${Math.round((newTone[k] ?? before[k]) * 100)}%`
-          ).join(", ");
-          console.log(`[SKILL] evaluate_response → 피드백 반영 (score: ${feedback.score}) → ${changes}`);
-          trace.push(`📋 Skill: evaluate_response → 피드백 반영 (score: ${feedback.score}) → ${changes}`);
-        } else {
-          console.log("[SKILL] evaluate_response → 피드백 없음");
-          trace.push(`📋 Skill: evaluate_response → 피드백 없음`);
-        }
-      } catch {
-        console.log("[SKILL] evaluate_response → 평가 실패");
-        trace.push(`📋 Skill: evaluate_response → 평가 실패`);
-      }
-    }
-
+    console.log(`[FALLBACK] direct Ollama 응답 완료 (${elapsed}초)`);
+    trace.push(`🔄 Direct Ollama fallback 응답 완료 (${elapsed}초)`);
     console.log(`[WEB] 응답 전송 (user=${userId})`);
     trace.push("🖥️ Web UI → 응답 전송");
     return {
       response,
       trace,
-      fullLog: { model: "nvidia+ollama(qwen-cs)", userId, category: classification.category, entities },
+      fullLog: { model: "direct-ollama(qwen-cs)", userId, category: classification.category, fallback: true },
     };
   } catch (err) {
-    try {
-      const t2 = Date.now();
-      const fallbackMsgs = [
-        { role: "system", content: systemPrompt },
-        ...messages,
-      ];
-      const response = await callOllama(fallbackMsgs);
-      const elapsed = ((Date.now() - t2) / 1000).toFixed(1);
-      console.log(`[PI] → 직접 Ollama 호출 (2차 fallback, ${elapsed}초)`);
-      trace.push(`🧩 Pi CLI → 직접 Ollama 호출 (2차 fallback, ${elapsed}초)`);
-      console.log(`[WEB] 응답 전송 (user=${userId})`);
-      trace.push("🖥️ Web UI → 응답 전송");
-      return {
-        response,
-        trace,
-        fullLog: { model: "direct-ollama(qwen-cs)", userId, category: classification.category, entities, fallback: true },
-      };
-    } catch (fallbackErr) {
-      return { response: `[오류] ${err.message}`, fullLog: err.message, trace: [] };
-    }
+    return { response: `[오류] ${err.message}`, fullLog: err.message, trace: [] };
   }
 }
 

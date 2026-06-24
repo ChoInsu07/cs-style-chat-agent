@@ -1,7 +1,93 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { readFileSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
+import { resolve } from "node:path";
+import { spawn } from "node:child_process";
+import { createInterface } from "node:readline";
 
 const LLM_API = "http://localhost:11434/v1/chat/completions";
+const ROOT = resolve(import.meta.dirname!, "..");
+const KNOWLEDGE_DIR = resolve(ROOT, "data/knowledge");
+const TICKET_DIR = resolve(ROOT, "data/tickets");
+
+// ── MCP JSON-RPC bridge ────────────────────────────────
+function getMCPServerConfig(name: string): { command: string; args: string[]; env: Record<string, string> } | null {
+  const mcpPath = resolve(ROOT, ".mcp.json");
+  if (!existsSync(mcpPath)) return null;
+  try {
+    const config = JSON.parse(readFileSync(mcpPath, "utf-8"));
+    const server = config.mcpServers?.[name];
+    if (!server) return null;
+    return { command: server.command, args: server.args || [], env: server.env || {} };
+  } catch { return null; }
+}
+
+function callMCPTool(serverName: string, toolName: string, toolArgs: Record<string, any>): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const cfg = getMCPServerConfig(serverName);
+    if (!cfg) { reject(new Error(`MCP server "${serverName}" not configured in .mcp.json`)); return; }
+
+    const proc = spawn(cfg.command, cfg.args, {
+      cwd: ROOT,
+      env: { ...process.env, ...cfg.env },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    const rl = createInterface({ input: proc.stdout });
+    const pending = new Map<number, { resolve: (v: any) => void; reject: (e: any) => void }>();
+    let idCounter = 1;
+    let settled = false;
+
+    const timeout = setTimeout(() => {
+      if (!settled) { settled = true; reject(new Error(`MCP ${serverName}/${toolName} timeout`)); cleanup(); }
+    }, 30000);
+
+    function cleanup() {
+      clearTimeout(timeout);
+      rl.close();
+      proc.kill();
+    }
+
+    rl.on("line", (line: string) => {
+      try {
+        const msg = JSON.parse(line);
+        if (msg.id != null && pending.has(msg.id)) {
+          const entry = pending.get(msg.id)!;
+          pending.delete(msg.id);
+          if (msg.error) entry.reject(new Error(msg.error.message));
+          else entry.resolve(msg.result);
+        }
+      } catch { /* skip non-JSON lines */ }
+    });
+
+    function send(method: string, params: any = {}): Promise<any> {
+      const id = idCounter++;
+      return new Promise((res, rej) => {
+        pending.set(id, { resolve: res, reject: rej });
+        proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+      });
+    }
+
+    (async () => {
+      try {
+        await send("initialize", {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "cs-agent-extension", version: "1.0.0" },
+        });
+        proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+        const result = await send("tools/call", { name: toolName, arguments: toolArgs });
+        if (!settled) { settled = true; resolve(result); cleanup(); }
+      } catch (e) {
+        if (!settled) { settled = true; reject(e); cleanup(); }
+      }
+    })();
+
+    proc.on("error", (e: Error) => {
+      if (!settled) { settled = true; reject(e); cleanup(); }
+    });
+  });
+}
 
 function textResult(text: string, isError = false) {
   return { content: [{ type: "text" as const, text }], details: {}, isError };
@@ -9,11 +95,21 @@ function textResult(text: string, isError = false) {
 
 function fixJSON(raw: string): string {
   try { JSON.parse(raw); return raw; } catch {}
-  return raw
+  let s = raw
     .replace(/'/g, '"')
     .replace(/True/g, "true")
     .replace(/False/g, "false")
     .replace(/None/g, "null");
+  // Remove trailing commas before } or ]
+  s = s.replace(/,\s*([}\]])/g, "$1");
+  // Try again
+  try { JSON.parse(s); return s; } catch {}
+  // Replace unquoted keys (word before colon)
+  s = s.replace(/([{,]\s*)(\w+)(\s*:)/g, '$1"$2"$3');
+  // Replace unquoted string values (word after colon, before comma/brace)
+  s = s.replace(/:\s*(\w+)\s*([,\]])/g, ':"$1"$2');
+  try { JSON.parse(s); return s; } catch {}
+  return s; // best effort
 }
 
 async function callLLM(system: string, user: string): Promise<string> {
@@ -356,6 +452,61 @@ export default function (pi: ExtensionAPI) {
         }));
       } catch (e: any) {
         return textResult(JSON.stringify({ updatedTone: null, error: e.message }), true);
+      }
+    },
+  });
+
+  // ── 도구 7: MCP knowledge-base → 정책 파일 조회 ────────────────
+  pi.registerTool({
+    name: "read_knowledge_policy",
+    label: "Read Knowledge Policy",
+    description: "MCP knowledge-base를 통해 지정된 카테고리의 정책 파일(refund/account/technical/billing/general)을 읽어온다. (JSON-RPC over stdio)",
+    parameters: Type.Object({
+      category: Type.String({ description: "정책 카테고리 (refund/account/technical/billing/general)" }),
+    }),
+    execute: async (_id, params) => {
+      try {
+        const category = params.category;
+        const filePath = resolve(KNOWLEDGE_DIR, `${category}.json`);
+        const mcpResult = await callMCPTool("knowledge-base", "read_file", { path: filePath });
+        const text = mcpResult?.content?.[0]?.text;
+        if (text) return textResult(text);
+        return textResult(JSON.stringify({ error: `empty result from MCP for ${category}` }));
+      } catch (e: any) {
+        return textResult(JSON.stringify({ error: `MCP read_knowledge_policy 실패: ${e.message}` }), true);
+      }
+    },
+  });
+
+  // ── 도구 8: MCP ticket-store → 상담 내역 저장 ─────────────────
+  pi.registerTool({
+    name: "save_ticket",
+    label: "Save Ticket",
+    description: "MCP ticket-store에 상담 내역을 저장한다. (JSON-RPC over stdio)",
+    parameters: Type.Object({
+      data: Type.String({ description: "저장할 상담 데이터 (JSON 문자열)" }),
+    }),
+    execute: async (_id, params) => {
+      try {
+        const data = params.data;
+        const ts = Date.now();
+        const key = `ticket-${ts}`;
+        let parsed: any;
+        try { parsed = JSON.parse(data); } catch { parsed = { raw: data }; }
+        const observations: string[] = [];
+        if (parsed.userId) observations.push(`user: ${parsed.userId}`);
+        if (parsed.category) observations.push(`category: ${parsed.category}`);
+        if (parsed.sentiment) observations.push(`sentiment: ${parsed.sentiment}`);
+        if (parsed.response) observations.push(`response: ${parsed.response.substring(0, 100)}`);
+        observations.push(`timestamp: ${new Date(ts).toISOString()}`);
+
+        await callMCPTool("ticket-store", "create_entities", {
+          entities: [{ name: key, entityType: "ticket", observations }],
+        });
+
+        return textResult(JSON.stringify({ ok: true, key, timestamp: ts, mcp: "ticket-store/create_entities" }));
+      } catch (e: any) {
+        return textResult(JSON.stringify({ ok: false, error: `MCP save_ticket 실패: ${e.message}` }), true);
       }
     },
   });
